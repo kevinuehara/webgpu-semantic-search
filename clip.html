@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Offline-First Visual Search (CLIP + WebGPU)</title>
+  <style>
+    :root {
+      --bg: #0b0f19;
+      --card-bg: #141b2d;
+      --border: #1f2a44;
+      --accent: #38bdf8;
+      --accent-green: #34d399;
+      --text: #f8fafc;
+      --text-muted: #94a3b8;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    body { background-color: var(--bg); color: var(--text); padding: 2rem 1.5rem; max-width: 1300px; margin: 0 auto; }
+    header { margin-bottom: 1.5rem; text-align: center; }
+    h1 { font-size: 2rem; margin-bottom: 0.4rem; background: linear-gradient(90deg, #38bdf8, #818cf8); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+    p.subtitle { color: var(--text-muted); font-size: 0.95rem; }
+
+    .status-container { background: var(--card-bg); border: 1px solid var(--border); border-radius: 10px; padding: 1.2rem; margin-bottom: 1.5rem; }
+    .status-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.75rem; font-size: 0.9rem; }
+    .status-indicator { display: flex; align-items: center; gap: 0.5rem; }
+    .dot { width: 10px; height: 10px; border-radius: 50%; background: #eab308; box-shadow: 0 0 8px #eab308; }
+    .dot.ready { background: var(--accent-green); box-shadow: 0 0 8px var(--accent-green); }
+    .progress-bar-bg { width: 100%; height: 8px; background: #1e293b; border-radius: 4px; overflow: hidden; margin-bottom: 0.5rem; }
+    .progress-bar-fill { height: 100%; width: 0%; background: linear-gradient(90deg, var(--accent), var(--accent-green)); transition: width 0.3s ease; }
+    .status-detail { font-size: 0.8rem; color: var(--text-muted); font-family: monospace; }
+    .badges { display: flex; gap: 0.5rem; }
+    .badge { padding: 0.2rem 0.5rem; border-radius: 4px; font-size: 0.75rem; font-weight: 600; background: #1e293b; border: 1px solid var(--border); color: var(--accent); }
+
+    .search-bar { width: 100%; padding: 1rem 1.25rem; background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; color: var(--text); font-size: 1.05rem; outline: none; margin-bottom: 2rem; }
+    .search-bar:focus { border-color: var(--accent); }
+    .search-bar:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 1.5rem; }
+    .card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; display: flex; flex-direction: column; transition: transform 0.2s, border-color 0.2s, box-shadow 0.2s; }
+    .card.top-match { border-color: var(--accent); box-shadow: 0 0 16px rgba(56, 189, 248, 0.35); transform: translateY(-2px); }
+    .card img { width: 100%; height: 190px; object-fit: cover; background: #1e293b; }
+    .card-info { padding: 0.75rem 1rem; display: flex; justify-content: space-between; align-items: center; font-size: 0.85rem; color: var(--text-muted); }
+    .score { font-weight: 700; color: var(--accent); }
+  </style>
+</head>
+<body>
+
+  <header>
+    <h1>Client-Side Multimodal Visual Search (CLIP + WebGPU)</h1>
+    <p class="subtitle">Direct image pixel analysis powered 100% locally in your browser with zero network requests</p>
+  </header>
+
+  <div class="status-container">
+    <div class="status-header">
+      <div class="status-indicator">
+        <span class="dot" id="status-dot"></span>
+        <strong id="status-title">Initializing...</strong>
+      </div>
+      <div class="badges">
+        <span class="badge" id="backend-badge">WebGPU: Checking</span>
+        <span class="badge" id="latency-badge">Latency: --</span>
+      </div>
+    </div>
+    <div class="progress-bar-bg">
+      <div class="progress-bar-fill" id="progress-fill"></div>
+    </div>
+    <div class="status-detail" id="status-detail">Checking local storage and pipeline...</div>
+  </div>
+
+  <input 
+    type="text" 
+    id="search-input" 
+    class="search-bar" 
+    placeholder="Loading CLIP models..." 
+    disabled 
+  />
+
+  <main class="grid" id="gallery"></main>
+
+  <script type="module">
+    import { 
+      env,
+      AutoTokenizer, 
+      AutoProcessor, 
+      CLIPTextModelWithProjection, 
+      CLIPVisionModelWithProjection, 
+      RawImage 
+    } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.0.2';
+
+    env.useBrowserCache = true;
+    env.allowLocalModels = false;
+    env.allowRemoteModels = true;
+
+    const images = [
+      { id: 1, name: 'Coffee', url: 'https://images.unsplash.com/photo-1514432324607-a09d9b4aefdd?auto=format&fit=crop&w=500&q=80', localUrl: null, embedding: null },
+      { id: 2, name: 'Sleeping Cat', url: 'https://images.unsplash.com/photo-1541781774459-bb2af2f05b55?auto=format&fit=crop&w=500&q=80', localUrl: null, embedding: null },
+      { id: 3, name: 'Tropical Beach', url: 'https://images.unsplash.com/photo-1507525428034-b723cf961d3e?auto=format&fit=crop&w=500&q=80', localUrl: null, embedding: null },
+      { id: 4, name: 'Circuit Board', url: 'https://images.unsplash.com/photo-1518770660439-4636190af475?auto=format&fit=crop&w=500&q=80', localUrl: null, embedding: null },
+      { id: 5, name: 'Sports Car', url: 'https://images.unsplash.com/photo-1503376780353-7e6692767b70?auto=format&fit=crop&w=500&q=80', localUrl: null, embedding: null },
+      { id: 6, name: 'Night Galaxy', url: 'https://images.unsplash.com/photo-1534447677768-be436bb09401?auto=format&fit=crop&w=500&q=80', localUrl: null, embedding: null },
+      { id: 7, name: 'Slice of Pizza', url: 'https://images.unsplash.com/photo-1513104890138-7c749659a591?auto=format&fit=crop&w=500&q=80', localUrl: null, embedding: null },
+      { id: 8, name: 'Dog in Grass', url: 'https://images.unsplash.com/photo-1543466835-00a7907e9de1?auto=format&fit=crop&w=500&q=80', localUrl: null, embedding: null },
+      { id: 9, name: 'Snow Mountains', url: 'https://images.unsplash.com/photo-1464822759023-fed622ff2c3b?auto=format&fit=crop&w=500&q=80', localUrl: null, embedding: null },
+      { id: 10, name: 'Modern Laptop', url: 'https://images.unsplash.com/photo-1496181133206-80ce9b88a853?auto=format&fit=crop&w=500&q=80', localUrl: null, embedding: null },
+      { id: 11, name: 'Neon Cyberpunk City', url: 'https://images.unsplash.com/photo-1508739773434-c26b3d09e071?auto=format&fit=crop&w=500&q=80', localUrl: null, embedding: null },
+      { id: 12, name: 'Fresh Burger', url: 'https://images.unsplash.com/photo-1568901346375-23c9450c58cd?auto=format&fit=crop&w=500&q=80', localUrl: null, embedding: null }
+    ];
+
+    let tokenizer, textModel, processor, visionModel;
+    let isSearching = false;
+
+    const statusDot = document.getElementById('status-dot');
+    const statusTitle = document.getElementById('status-title');
+    const statusDetail = document.getElementById('status-detail');
+    const progressFill = document.getElementById('progress-fill');
+    const backendBadge = document.getElementById('backend-badge');
+    const latencyBadge = document.getElementById('latency-badge');
+    const searchInput = document.getElementById('search-input');
+    const gallery = document.getElementById('gallery');
+
+    function updateStatus(title, detail, progressPct) {
+      statusTitle.textContent = title;
+      statusDetail.textContent = detail;
+      if (progressPct !== undefined) {
+        progressFill.style.width = `${progressPct}%`;
+      }
+    }
+
+    // Gerenciamento de Armazenamento Local via IndexedDB (Offline Permanente)
+    function openDB() {
+      return new Promise((resolve, reject) => {
+        const req = indexedDB.open('CLIP_Demo_Store', 1);
+        req.onupgradeneeded = (e) => {
+          e.target.result.createObjectStore('media');
+        };
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      });
+    }
+
+    async function getStoredBlob(id) {
+      const db = await openDB();
+      return new Promise((resolve) => {
+        const tx = db.transaction('media', 'readonly');
+        const req = tx.objectStore('media').get(id);
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => resolve(null);
+      });
+    }
+
+    async function saveStoredBlob(id, blob) {
+      const db = await openDB();
+      return new Promise((resolve) => {
+        const tx = db.transaction('media', 'readwrite');
+        tx.objectStore('media').put(blob, id);
+        tx.oncomplete = () => resolve();
+      });
+    }
+
+    function normalizeL2(data) {
+      const vec = new Float32Array(data);
+      let sum = 0;
+      for (let i = 0; i < vec.length; i++) sum += vec[i] * vec[i];
+      const norm = Math.sqrt(sum) || 1;
+      for (let i = 0; i < vec.length; i++) vec[i] /= norm;
+      return vec;
+    }
+
+    function renderGallery(items, scores = {}) {
+      gallery.innerHTML = '';
+      const hasScores = Object.keys(scores).length > 0;
+
+      const scoreVals = Object.values(scores);
+      const minS = hasScores ? Math.min(...scoreVals) : 0;
+      const maxS = hasScores ? Math.max(...scoreVals) : 1;
+      const range = (maxS - minS) || 1;
+
+      items.forEach((item, index) => {
+        let displayScore = '--';
+        if (hasScores && scores[item.id] !== undefined) {
+          const pct = ((scores[item.id] - minS) / range) * 100;
+          displayScore = `${pct.toFixed(1)}%`;
+        }
+
+        const card = document.createElement('div');
+        card.className = `card ${index === 0 && hasScores ? 'top-match' : ''}`;
+        card.innerHTML = `
+          <img src="${item.localUrl || item.url}" alt="${item.name}" />
+          <div class="card-info">
+            <span>#${item.id} (${item.name})</span>
+            <span class="score">${displayScore}</span>
+          </div>
+        `;
+        gallery.appendChild(card);
+      });
+    }
+
+    async function init() {
+      try {
+        updateStatus('Loading CLIP models...', 'Compiling WebGPU shaders...', 10);
+        backendBadge.textContent = 'WebGPU: Allocating';
+
+        const modelId = 'Xenova/clip-vit-base-patch32';
+
+        [tokenizer, textModel, processor, visionModel] = await Promise.all([
+          AutoTokenizer.from_pretrained(modelId),
+          CLIPTextModelWithProjection.from_pretrained(modelId, { device: 'webgpu', dtype: 'fp32' }),
+          AutoProcessor.from_pretrained(modelId),
+          CLIPVisionModelWithProjection.from_pretrained(modelId, { device: 'webgpu', dtype: 'fp32' })
+        ]);
+
+        backendBadge.textContent = 'WebGPU: Active';
+        updateStatus('Models ready', 'Checking image storage and cache...', 25);
+
+        for (let i = 0; i < images.length; i++) {
+          const pct = 25 + Math.round(((i + 1) / images.length) * 70);
+          updateStatus(
+            `Indexing image ${i + 1}/${images.length}...`,
+            `Loading and vectorizing "${images[i].name}"...`,
+            pct
+          );
+
+          // 1. Tenta recuperar o Blob do IndexedDB local
+          let blob = await getStoredBlob(images[i].id);
+
+          // 2. Se não existir, baixa da rede e grava para as próximas sessões offline
+          if (!blob) {
+            const resp = await fetch(images[i].url);
+            blob = await resp.blob();
+            await saveStoredBlob(images[i].id, blob);
+          }
+
+          // 3. Cria uma URL de objeto local válida mesmo com internet cortada
+          images[i].localUrl = URL.createObjectURL(blob);
+
+          const rawImage = await RawImage.fromBlob(blob);
+          const imageInputs = await processor(rawImage);
+          const visionOutputs = await visionModel(imageInputs);
+          const rawEmbeds = visionOutputs.image_embeds || visionOutputs[0];
+          images[i].embedding = normalizeL2(rawEmbeds.data);
+        }
+
+        renderGallery(images);
+
+        updateStatus('Ready for local search (100% Offline)', 'All image pixels and models are stored on device.', 100);
+        statusDot.classList.add('ready');
+        searchInput.disabled = false;
+        searchInput.placeholder = 'Try: "sleeping cat", "galaxy with stars", "fast car", "cheesy pizza", "dog in grass"...';
+        searchInput.focus();
+
+      } catch (err) {
+        console.error(err);
+        statusDot.style.background = '#ef4444';
+        statusDot.style.boxShadow = '0 0 8px #ef4444';
+        updateStatus('Initialization error', err.message, 0);
+      }
+    }
+
+    async function runSearch(query) {
+      const q = query.trim();
+      if (!q || !textModel || !tokenizer || isSearching) return;
+
+      isSearching = true;
+      const t0 = performance.now();
+
+      try {
+        const prompt = `a photo of a ${q}`;
+        const textInputs = tokenizer([prompt], { padding: true, truncation: true });
+        const textOutputs = await textModel(textInputs);
+
+        const rawTextEmbeds = textOutputs.text_embeds || textOutputs[0];
+        const queryVec = normalizeL2(rawTextEmbeds.data);
+
+        const scores = {};
+        for (const item of images) {
+          let dot = 0;
+          for (let j = 0; j < queryVec.length; j++) {
+            dot += queryVec[j] * item.embedding[j];
+          }
+          scores[item.id] = dot;
+        }
+
+        const ranked = [...images].sort((a, b) => scores[b.id] - scores[a.id]);
+
+        const latency = (performance.now() - t0).toFixed(1);
+        latencyBadge.textContent = `Latency: ${latency}ms`;
+
+        renderGallery(ranked, scores);
+      } finally {
+        isSearching = false;
+      }
+    }
+
+    let debounceTimer;
+    searchInput.addEventListener('input', (e) => {
+      clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(() => runSearch(e.target.value), 200);
+    });
+
+    init();
+  </script>
+</body>
+</html>
